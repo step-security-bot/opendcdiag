@@ -634,8 +634,10 @@ static ShortDuration test_duration()
     return SandstoneApplication::DefaultTestDuration;
 }
 
-static ShortDuration test_duration(const struct test *test)
+static ShortDuration test_duration(const test_cfg_info &test_cfg)
 {
+    const struct test *test = test_cfg.test;
+
     /* Start with the test prefered default time */
     ShortDuration target_duration(test->desired_duration);
     ShortDuration min_duration(test->minimum_duration);
@@ -644,6 +646,10 @@ static ShortDuration test_duration(const struct test *test)
     /* apply the global (-t) override */
     if (sApp->test_time.count())
         target_duration = sApp->test_time;
+
+    /* apply the per-test time from the test list (overrides global -t) */
+    if (test_cfg.duration.count())
+        target_duration = test_cfg.duration;
 
     /* fallback to the default if test preference is zero */
     if (target_duration <= 0s)
@@ -713,13 +719,14 @@ static bool max_loop_count_exceeded(const struct test *the_test)
 extern "C" void test_loop_iterate() noexcept;    // see below
 
 /* returns 1 if the test should keep running, useful for a while () loop */
-int test_time_condition(const struct test *the_test) noexcept
+#undef test_time_condition
+bool test_time_condition() noexcept
 {
     test_loop_iterate();
-    sApp->test_tests_iteration(the_test);
+    sApp->test_tests_iteration(current_test);
     sApp->test_thread_data(thread_num)->inner_loop_count++;
 
-    if (max_loop_count_exceeded(the_test))
+    if (max_loop_count_exceeded(current_test))
         return 0;  // end the test if max loop count exceeded
 
     return !wallclock_deadline_has_expired(sApp->shmem->current_test_endtime);
@@ -1592,7 +1599,7 @@ static void wait_for_children(ChildrenList &children, const struct test *test)
     auto remove_debug_socket = scopeExit([&] { children.pollfds.pop_back(); });
 
     static constexpr int TimeoutSignal = SIGQUIT;
-    auto kill_children = [&](int sig = SIGKILL) {        
+    auto kill_children = [&](int sig = SIGKILL) {
         // Send the signal to the child's process group, so all its children
         // get the signal too.
         for (pid_t child : children.handles) {
@@ -2294,8 +2301,10 @@ static void analyze_test_failures(const struct test *test, int fail_count, int a
     }
 }
 
-TestResult run_one_test(const struct test *test, SandstoneApplication::PerCpuFailures &per_cpu_fails)
+static TestResult
+run_one_test(const test_cfg_info &test_cfg, SandstoneApplication::PerCpuFailures &per_cpu_fails)
 {
+    const struct test *test = test_cfg.test;
     TestResult state = TestResult::Skipped;
     int fail_count = 0;
     std::unique_ptr<char[]> random_allocation;
@@ -2321,7 +2330,7 @@ TestResult run_one_test(const struct test *test, SandstoneApplication::PerCpuFai
         });
     };
 
-    sApp->current_test_duration = test_duration(test);
+    sApp->current_test_duration = test_duration(test_cfg);
     first_iteration_target = MonotonicTimePoint::clock::now() + 10ms;
 
     if (sApp->max_test_loop_count) {
@@ -2347,7 +2356,7 @@ TestResult run_one_test(const struct test *test, SandstoneApplication::PerCpuFai
         //change frequency per fracture
         if (sApp->vary_frequency_mode == true)
             sApp->frequency_manager.change_core_frequency();
-        
+
         //change uncore frequency per fracture
         if (sApp->vary_uncore_frequency_mode == true)
             sApp->frequency_manager.change_uncore_frequency();
@@ -2427,7 +2436,7 @@ out:
     //reset frequency level idx for the next test
     if (sApp->vary_frequency_mode || sApp->vary_uncore_frequency_mode)
         sApp->frequency_manager.reset_frequency_level_idx();
-    
+
     random_advance_seed();      // advance seed for the next test
     logging_flush();
     return state;
@@ -2440,11 +2449,11 @@ static auto collate_test_groups()
         std::vector<const struct test *> entries;
     };
     std::map<std::string_view, Group> groups;
-    for (struct test *t : *test_set) {
-        for (auto ptr = t->groups; ptr && *ptr; ++ptr) {
+    for (const auto &ti : *test_set) {
+        for (auto ptr = ti.test->groups; ptr && *ptr; ++ptr) {
             Group &g = groups[(*ptr)->id];
             g.definition = *ptr;
-            g.entries.push_back(t);
+            g.entries.push_back(ti.test);
         }
     }
 
@@ -2460,8 +2469,8 @@ static void list_tests(int opt)
     auto groups = collate_test_groups();
     int i = 0;
 
-    for (auto it = test_set->begin(); it != test_set->end(); ++it) {
-        struct test *test = *it;
+    for (const auto &ti : *test_set) {
+        struct test *test = ti.test;
         if (test->quality_level >= sApp->requested_quality) {
             if (include_tests) {
                 if (include_descriptions) {
@@ -2537,25 +2546,39 @@ static bool should_start_next_iteration(void)
     return true;
 }
 
-static SandstoneTestSet::TestSetIterator get_next_test(SandstoneTestSet::TestSetIterator &it)
+static SandstoneTestSet::EnabledTestList::iterator
+get_next_test(SandstoneTestSet::EnabledTestList::iterator next_test)
 {
     if (sApp->shmem->use_strict_runtime && wallclock_deadline_has_expired(sApp->endtime))
         return test_set->end();
 
-    auto next_test = it++;
-    while (next_test != test_set->end() && (*next_test)->quality_level < sApp->requested_quality) next_test = it++;
+    ++next_test;
+    while (next_test != test_set->end() && next_test->test->quality_level < sApp->requested_quality)
+        ++next_test;
     if (next_test == test_set->end()) {
         if (should_start_next_iteration()) {
+            /* whenever we're restarting, print the header for the next
+             * iteration. */
+            logging_print_iteration_start();
             next_test = test_set->begin();
         } else {
             return test_set->end();
         }
     }
 
-    assert((*next_test)->id);
-    assert((*next_test)->description);
-    assert(strlen((*next_test)->id));
+    assert(next_test->test->id);
+    assert(next_test->test->description);
+    assert(strlen(next_test->test->id));
     return next_test;
+}
+
+static SandstoneTestSet::EnabledTestList::iterator get_first_test()
+{
+    logging_print_iteration_start();
+    auto it = test_set->begin();
+    while (it != test_set->end() && it->test->quality_level < sApp->requested_quality)
+        ++it;
+    return it;
 }
 
 static bool wait_delay_between_tests()
@@ -2602,84 +2625,6 @@ static int exec_mode_run(int argc, char **argv)
     random_init_global(argv[1]);
 
     return test_result_to_exit_code(child_run(tests_to_run.at(0), child_number));
-}
-
-// Triage run attempts to figure out which socket(s) are causing test failures.
-// It simply removes sockets from the cpu_set_t one by one until the failures no
-// longer observed.
-// Returns the list of faulty sockets. Memory is allocated, caller must free.
-// TODO: Current implementation only returns 1 socket. However, the signature is
-// generic vector<int> for the future improvements.
-static vector<int> run_triage(vector<const struct test *> &triage_tests)
-{
-    const Topology &orig_topo = Topology::topology();
-    vector<int> result; // faulty sockets
-
-    if (orig_topo.packages.empty())
-        return result;                  // shouldn't happen!
-
-    if (orig_topo.packages.size() == 1) {
-        result.push_back(orig_topo.packages.front().id());
-        return result;
-    }
-
-    // backup the original CPU info
-    Topology::Data topo = orig_topo.clone();
-    auto run_tests_with_retest = [&](std::span<const Topology::Package> set) {
-        SandstoneApplication::PerCpuFailures per_cpu_failures;
-        int k = 0;
-        int ret = EXIT_SUCCESS;
-
-        // all the shady stuff needed to set up to run a test smoothly
-        update_topology(topo.all_threads, set);
-        slice_plan_init(INT_MAX);   // full sockets
-
-        do {
-            int test_count = 1;
-            for (auto &t: triage_tests) {
-                ret = test_result_to_exit_code(run_one_test(t, per_cpu_failures));
-                if (ret > EXIT_SUCCESS) break; // EXIT_SKIP is OK
-                test_count++;
-            }
-        } while (!ret && ++k < sApp->retest_count);
-
-        return (ret > EXIT_SUCCESS) ? ret : EXIT_SUCCESS; // do not return SKIP from here
-    };
-
-    // backup the original verbosity
-    int orig_verbosity = sApp->shmem->verbosity;
-    sApp->shmem->verbosity = -1;
-
-    int ret = EXIT_SUCCESS;
-    bool ever_failed = false;
-    vector<int> disabled_sockets;
-    for (auto it = topo.packages.begin(); it != topo.packages.end(); ++it) {
-        ret = run_tests_with_retest({ it, topo.packages.end() });
-        if (ret) ever_failed = true; /* we've seen a failure */
-
-        if (!ret && ever_failed) {
-            // the last socket removed is the main suspect
-            result.push_back(disabled_sockets.at(disabled_sockets.size() - 1));
-            break;
-        }
-        disabled_sockets.push_back(it->id());
-    }
-
-    if (ret) { // failed on the last socket as well, so it's the main suspect
-        // re-run on the first to make sure the last one is faulty
-        ret = run_tests_with_retest({ topo.packages.begin(), 1 });
-        if (!ret && ever_failed) {
-            result.push_back(disabled_sockets.at(disabled_sockets.size() - 1));
-        }
-    }
-
-    // restore the original verbosity
-    sApp->shmem->verbosity = orig_verbosity;
-
-    // restore original topology
-    update_topology(topo.all_threads);
-
-    return result;
 }
 
 namespace {
@@ -3220,7 +3165,6 @@ int main(int argc, char **argv)
     int total_skips = 0;
     int thread_count = -1;
     bool fatal_errors = false;
-    bool do_not_triage = true;
     const char *on_hang_arg = nullptr;
     const char *on_crash_arg = nullptr;
 
@@ -3339,7 +3283,6 @@ int main(int argc, char **argv)
             } else {
                 sApp->endtime = sApp->starttime + string_to_millisecs(optarg);
             }
-            sApp->shmem->use_strict_runtime = true;
             test_set_config.cycle_through = true; /* Time controls when the execution stops as
                                                      opposed to the number of tests. */
             break;
@@ -3393,12 +3336,6 @@ int main(int argc, char **argv)
             break;
         case no_slicing_option:
             max_cores_per_slice = -1;
-            break;
-        case triage_option:
-            do_not_triage = false;
-            break;
-        case no_triage_option:
-            do_not_triage = true;
             break;
         case on_crash_option:
             on_crash_arg = optarg;
@@ -3556,7 +3493,7 @@ int main(int argc, char **argv)
             }
             sApp->vary_frequency_mode = true;
             break;
-        
+
         case vary_uncore_frequency:
             if (!FrequencyManager::FrequencyManagerWorks) {
                 fprintf(stderr, "%s: --vary-uncore-frequency works only on Linux\n", program_invocation_name);
@@ -3609,8 +3546,10 @@ int main(int argc, char **argv)
         case mem_sample_time_option:
         case mem_samples_per_log_option:
         case no_mem_sampling_option:
+        case no_triage_option:
         case schedule_by_option:
         case shortened_runtime_option:
+        case triage_option:
         case weighted_testrun_option:
             warn_deprecated_opt(long_options[coptind].name);
             break;
@@ -3666,7 +3605,6 @@ int main(int argc, char **argv)
 
         sApp->delay_between_tests = 50ms;
         sApp->thermal_throttle_temp = INT_MIN;
-        do_not_triage = SandstoneConfig::NoTriage;
         fatal_errors = true;
         builtin_test_list_name = "auto";
 
@@ -3716,7 +3654,7 @@ int main(int argc, char **argv)
     /* Add all the tests we were told to enable. */
     if (enabled_tests.size()) {
         for (auto name : enabled_tests) {
-            auto tis = test_set->enable(name);
+            auto tis = test_set->add(name);
             if (!tis.size() && !test_set_config.ignore_unknown_tests) {
                 fprintf(stderr, "%s: Cannot find matching tests for '%s'\n", program_invocation_name, name);
                 exit(EX_USAGE);
@@ -3750,27 +3688,27 @@ int main(int argc, char **argv)
 
     /* Add mce_check as the last test to the set. It will be kept last by
      * SandstoneTestSet in case randomization is requested. */
-    test_set->enable(&mce_test);
+    test_set->add(&mce_test);
 
     /* Remove all the tests we were told to disable */
     if (disabled_tests.size()) {
         for (auto name : disabled_tests) {
-            test_set->disable(name);
+            test_set->remove(name);
         }
     }
 
     if (sApp->shmem->verbosity == -1)
         sApp->shmem->verbosity = (sApp->requested_quality < SandstoneApplication::DefaultQualityLevel) ? 1 : 0;
 
-    if (InterruptMonitor::InterruptMonitorWorks && test_set->is_enabled(mce_test.id)) {
+    if (InterruptMonitor::InterruptMonitorWorks && test_set->contains(&mce_test)) {
         sApp->last_thermal_event_count = sApp->count_thermal_events();
         sApp->mce_counts_start = sApp->get_mce_interrupt_counts();
 
         if (sApp->current_fork_mode() == SandstoneApplication::exec_each_test) {
-            test_set->disable(mce_test.id);
+            test_set->remove(&mce_test);
         } else if (sApp->mce_counts_start.empty()) {
             logging_printf(LOG_LEVEL_QUIET, "# WARNING: Cannot detect MCE events - you may be running in a VM - MCE checking disabled\n");
-            test_set->disable(mce_test.id);
+            test_set->remove(&mce_test);
         }
 
         sApp->mce_count_last = std::accumulate(sApp->mce_counts_start.begin(), sApp->mce_counts_start.end(), uint64_t(0));
@@ -3797,21 +3735,15 @@ int main(int argc, char **argv)
 
     logging_print_header(argc, argv, test_duration(), test_timeout(test_duration()));
 
-    // triage process is the best effort to figure out which socket is faulty on
-    // a multi-socket system, it's done after the main run and only using the
-    // failing tests.
     SandstoneApplication::PerCpuFailures per_cpu_failures;
-    vector<const struct test *> triage_tests;
 
     sApp->current_test_count = 0;
     int total_tests_run = 0;
     TestResult lastTestResult = TestResult::Skipped;
-    auto it = test_set->begin();
 
     initialize_smi_counts();  // used by smi_count test
-    logging_print_iteration_start();
 
-    for (auto test = get_next_test(it); test != test_set->end(); test = get_next_test(it)) {
+    for (auto it = get_first_test(); it != test_set->end(); it = get_next_test(it)) {
         if (lastTestResult != TestResult::Skipped) {
             if (sApp->service_background_scan) {
                 if (!background_scan_wait()) {
@@ -3826,13 +3758,11 @@ int main(int argc, char **argv)
             }
         }
 
-        lastTestResult = run_one_test(*test, per_cpu_failures);
+        lastTestResult = run_one_test(*it, per_cpu_failures);
 
         total_tests_run++;
         if (lastTestResult == TestResult::Failed) {
             ++total_failures;
-            // keep the record of failures to triage later
-            triage_tests.push_back(*test);
             if (fatal_errors)
                 break;
         } else if (lastTestResult == TestResult::Passed) {
@@ -3847,10 +3777,6 @@ int main(int argc, char **argv)
     }
 
     if (total_failures) {
-        if (!do_not_triage) {
-            vector<int> sockets = run_triage(triage_tests);
-            logging_print_triage_results(sockets);
-        }
         logging_print_footer();
     } else if (sApp->shmem->verbosity == 0 && sApp->shmem->output_format == SandstoneApplication::OutputFormat::tap) {
         logging_printf(LOG_LEVEL_QUIET, "Ran %d tests without error (%d skipped)\n",

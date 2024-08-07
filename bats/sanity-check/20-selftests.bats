@@ -6,7 +6,7 @@ load ../testenv
 
 sandstone_selftest() {
     VALIDATION=dump
-    run_sandstone_yaml -n$MAX_PROC --disable=mce_check --no-triage --selftests --timeout=20s --retest-on-failure=0 -Y2 "$@"
+    run_sandstone_yaml -n$MAX_PROC --disable=mce_check --selftests --timeout=20s --retest-on-failure=0 -Y2 "$@"
 }
 
 extract_from_yaml() {
@@ -200,7 +200,7 @@ tap_negative_check() {
     # not all tests
     for test in selftest_failinit selftest_fail; do
         local notok
-        run $SANDSTONE --output-format=tap --no-triage --selftests --retest-on-failure=4 --on-crash=kill -e $test -o /dev/null -v
+        run $SANDSTONE --output-format=tap --selftests --retest-on-failure=4 --on-crash=kill -e $test -o /dev/null -v
         [[ $status -eq 1 ]]
         sed 's/\r$//' <<<"$output" | {
             tap_negative_check "$test" ''
@@ -221,7 +221,7 @@ tap_negative_check() {
     fi
     ulimit -Sc 0                # disable core dumps
     for test in ${crashtests[@]}; do
-        run $SANDSTONE --output-format=tap --no-triage --selftests --retest-on-failure=0 --on-crash=kill -e $test -o /dev/null -v
+        run $SANDSTONE --output-format=tap --selftests --retest-on-failure=0 --on-crash=kill -e $test -o /dev/null -v
         [[ $status -eq 1 ]]
         sed 's/\r$//; /^wine: Unhandled/d' <<<"$output" | \
             tap_negative_check "$test" ' (Killed|Core Dumped):.*'
@@ -229,21 +229,21 @@ tap_negative_check() {
 }
 
 @test "TAP output OS error" {
-    run $SANDSTONE --output-format=tap --no-triage --selftests --retest-on-failure=0 --on-crash=kill -e selftest_oserror -o /dev/null -v
+    run $SANDSTONE --output-format=tap --selftests --retest-on-failure=0 --on-crash=kill -e selftest_oserror -o /dev/null -v
     [[ $status -eq 2 ]]
     sed 's/\r$//' <<<"$output" | \
         tap_negative_check selftest_oserror ' Operating system error:.*' "exit: invalid"
 }
 
 @test "TAP silent output" {
-    opts="--output-format=tap --quick --selftests --quiet --disable=mce_check -e @positive"
-    $SANDSTONE $opts > $BATS_TEST_TMPDIR/output.tap
+    local -a opts=(--output-format=tap --quick --selftests --quiet --disable=mce_check --disable="*fork" -e @positive)
+    $SANDSTONE "${opts[@]}" > $BATS_TEST_TMPDIR/output.tap
 
     sed -i -e 's/\r$//' $BATS_TEST_TMPDIR/output.tap
     {
         read line
         echo line 1: $line
-        [[ "$line" = "# ${SANDSTONE##*/} $opts" ]]
+        [[ "$line" = "# ${SANDSTONE##*/} ${opts[@]}" ]]
 
         read line
         echo line 2: $line
@@ -259,14 +259,14 @@ tap_negative_check() {
 }
 
 @test "YAML silent output" {
-    opts="-Y --quick --selftests --quiet --disable=mce_check -e @positive"
-    $SANDSTONE $opts > $BATS_TEST_TMPDIR/output.yaml
+    local -a opts=(-Y --quick --selftests --quiet --disable=mce_check --disable="*fork" -e @positive)
+    $SANDSTONE "${opts[@]}" > $BATS_TEST_TMPDIR/output.yaml
 
     sed -i -e 's/\r$//' $BATS_TEST_TMPDIR/output.yaml
     {
         read line
         echo line 1: $line
-        [[ "$line" = "command-line: '${SANDSTONE##*/} $opts'" ]]
+        [[ "$line" = "command-line: '${SANDSTONE##*/} ${opts[@]}'" ]]
 
         read line
         echo line 2: $line
@@ -582,6 +582,20 @@ selftest_log_skip_init_socket_common() {
     test_yaml_regexp "/exit" pass
     test_yaml_regexp "/tests/0/result" pass
     test_yaml_numeric "/tests/0/test-runtime" 'value >= 250'
+}
+
+@test "selftest_timedpass -t 25 -T 250" {
+    declare -A yamldump
+    sandstone_selftest -e selftest_timedpass -t 25 -T 250
+    [[ "$status" -eq 0 ]]
+    test_yaml_regexp "/exit" pass
+    local test_count=${yamldump[/tests@len]}
+    local i
+    for ((i = 0; i < test_count; ++i)); do
+        test_yaml_regexp "/tests/$i/result" pass
+        test_yaml_numeric "/tests/$i/test-runtime" 'value >= 25'
+    done
+    test_yaml_numeric "/tests/$((i-1))/time-at-start/elapsed" 'value < 250'
 }
 
 @test "selftest_timedpass -t 1150" {
@@ -943,7 +957,7 @@ test_list_file() {
 }
 
 @test "--test-list-file with duration" {
-    test_list_file selftest_pass:default selftest_timedpass:50
+    test_list_file selftest_pass:default selftest_timedpass:250 selftest_timedpass:10
 }
 
 @test "--test-list-file with comments and empty lines" {
@@ -1610,37 +1624,6 @@ crash_context_socket1_common() {
     test_yaml_regexp "/tests/0/result-details/reason" "Operating system error: configuration error"
 }
 
-@test "triage" {
-    if ! $is_debug; then
-        skip "Test only works with Debug builds (to mock the topology)"
-    fi
-    if (( MAX_PROC < 4 )); then
-        skip "Need at least 4 logical processors to run this test"
-    fi
-    declare -A yamldump
-    export SANDSTONE_MOCK_TOPOLOGY='0 1 2 3'
-
-    # can't use sandstone_selftest because of --no-triage
-    VALIDATION=dump
-    run_sandstone_yaml -n$MAX_PROC --disable=mce_check --selftests --timeout=20s --retest-on-failure=0 -Y -e selftest_fail_socket1 --triage
-
-    # confirm the topology took effect
-    for ((i = 0; i < 4; ++i)); do
-        test_yaml_numeric "/cpu-info/$i/logical" "value == $i"
-        test_yaml_numeric "/cpu-info/$i/package" "value == $i"
-        test_yaml_numeric "/cpu-info/$i/core" 'value == 0'
-        test_yaml_numeric "/cpu-info/$i/thread" 'value == 0'
-    done
-
-    # now confirm it exited properly
-    [[ "$status" -eq 1 ]]
-    test_yaml_regexp "/exit" fail
-
-    # and test it did triage properly
-    test_yaml_numeric "/triage-results@len" 'value == 1'
-    test_yaml_numeric "/triage-results/0" 'value == 1'
-}
-
 function selftest_cpuset() {
     local expected_logical=$1
     local expected_package=$2
@@ -1808,7 +1791,7 @@ selftest_cpuset_negated() {
     # Don't use sandstone_selftest to avoid -n$MAX_PROC
     VALIDATION=dump
     declare -A yamldump
-    run_sandstone_yaml --disable=mce_check --no-triage --selftests --timeout=20s --retest-on-failure=0 -e selftest_logs_getcpu
+    run_sandstone_yaml --disable=mce_check --selftests --timeout=20s --retest-on-failure=0 -e selftest_logs_getcpu
 
     # Did we get anything?
     if [[ ${yamldump[/tests/0/result]} = skip ]]; then
