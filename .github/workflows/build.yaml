@@ -22,6 +22,11 @@ jobs:
         - { name: GCC, selftests: "selftests" }
         - { name: Clang, env: "CC=clang-16 CXX=clang++-16" }
     steps:
+    - name: Harden Runner
+      uses: step-security/harden-runner@v2
+      with:
+        egress-policy: audit
+
     - name: setup environment
       run: printf '%s\n' ${{ matrix.env }} | tee -a ${GITHUB_ENV}
     - name: Install distro packages
@@ -81,6 +86,11 @@ jobs:
       WINEPREFIX: /tmp/wine_root
       WINEPATH: d:/bin
     steps:
+    - name: Harden Runner
+      uses: step-security/harden-runner@v2
+      with:
+        egress-policy: audit
+
     - name: Install distro packages
       run: |
         dnf install --setopt=install_weak_deps=False -y \

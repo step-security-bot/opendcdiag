@@ -8,6 +8,11 @@ jobs:
   lint:
     runs-on: ubuntu-latest
     steps:
+    - name: Harden Runner
+      uses: step-security/harden-runner@v2
+      with:
+        egress-policy: audit
+
     - name: Checkout target branch (${{ github.base_ref }})
       uses: actions/checkout@v2
       with:
@@ -24,6 +29,11 @@ jobs:
   git-sanity:
     runs-on: ubuntu-latest
     steps:
+    - name: Harden Runner
+      uses: step-security/harden-runner@v2
+      with:
+        egress-policy: audit
+
     - name: Checkout the PR merge point
       uses: actions/checkout@v2
       with:
